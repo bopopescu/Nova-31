@@ -1,5 +1,5 @@
 [gerrit]
-host=review.openstack.org
+host=gerrit.mirantis.com
 port=29418
 project=openstack/nova.git
-defaultbranch=stable/grizzly
+defaultbranch=openstack-ci/fuel/grizzly
