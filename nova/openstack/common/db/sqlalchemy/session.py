@@ -285,11 +285,19 @@ sql_opts = [
                     'pool'),
     cfg.IntOpt('sql_max_retries',
                default=10,
-               help='maximum db connection retries during startup. '
+               help='maximum db connection retries before error is raised. '
                     '(setting -1 implies an infinite retry count)'),
     cfg.IntOpt('sql_retry_interval',
                default=10,
-               help='interval between retries of opening a sql connection'),
+               help='seconds between sql connection retries'),
+    cfg.BoolOpt('sql_inc_retry_interval',
+                default=True,
+                help='Whether to increase interval between sql connection '
+                     'retries, up to sql_max_retry_interval'),
+    cfg.IntOpt('sql_max_retry_interval',
+                default=10,
+                help='max seconds between sql connection retries, if '
+                     'sql_inc_retry_interval is enabled'),
     cfg.IntOpt('sql_max_overflow',
                default=None,
                help='If set, use this value for max_overflow with sqlalchemy'),
@@ -326,6 +334,7 @@ def get_session(autocommit=True, expire_on_commit=False):
         _MAKER = get_maker(engine, autocommit, expire_on_commit)
 
     session = _MAKER()
+    session.expire_all()
     return session
 
 
@@ -410,32 +419,95 @@ def raise_if_deadlock_error(operational_error, engine_name):
     raise exception.DBDeadlock(operational_error)
 
 
+
 def wrap_db_error(f):
+    """Function wrapper to capture DB errors
+
+    If an exception is thrown by the wrapped function,
+    determine if it represents a database connection error.
+    If so, retry the wrapped function, and repeat until it succeeds
+    or we reach a configurable maximum number of retries.
+    If it is not a connection error, or we exceeded the retry limit,
+    raise a DBError.
+
+    """
     def _wrap(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        except UnicodeEncodeError:
-            raise exception.DBInvalidUnicodeParameter()
-        # note(boris-42): We should catch unique constraint violation and
-        # wrap it by our own DBDuplicateEntry exception. Unique constraint
-        # violation is wrapped by IntegrityError.
-        except sqla_exc.OperationalError, e:
-            raise_if_deadlock_error(e, get_engine().name)
-            # NOTE(comstud): A lot of code is checking for OperationalError
-            # so let's not wrap it for now.
-            raise
-        except sqla_exc.IntegrityError, e:
-            # note(boris-42): SqlAlchemy doesn't unify errors from different
-            # DBs so we must do this. Also in some tables (for example
-            # instance_types) there are more than one unique constraint. This
-            # means we should get names of columns, which values violate
-            # unique constraint, from error message.
-            raise_if_duplicate_entry_error(e, get_engine().name)
-            raise exception.DBError(e)
-        except Exception, e:
-            LOG.exception(_('DB exception wrapped.'))
-            raise exception.DBError(e)
-    _wrap.func_name = f.func_name
+        if get_engine().dialect.dbapi.__name__ == 'MySQLdb':
+            import MySQLdb
+            operational_errors = (MySQLdb.OperationalError,
+                                  sqla_exc.OperationalError)
+        else:
+            operational_errors = (sqla_exc.OperationalError,)
+
+        next_interval = CONF.sql_retry_interval
+        remaining = CONF.sql_max_retries
+        if remaining == -1:
+            remaining = 'infinite'
+        while True:
+            try:
+                return f(*args, **kwargs)
+            except UnicodeEncodeError:
+                raise exception.DBInvalidUnicodeParameter()
+            # note(boris-42): We should catch unique constraint violation and
+            # wrap it by our own DBDuplicateEntry exception. Unique constraint
+            # violation is wrapped by IntegrityError.
+            except operational_errors as e:
+                raise_if_deadlock_error(e, get_engine().name)
+                if is_db_connection_error(e.args[0]):
+                    if remaining == 0:
+                        LOG.exception(_('DB exceeded retry limit.'))
+                        raise DBError(e)
+                    if remaining != 'infinite':
+                        remaining -= 1
+                    LOG.exception(_('DB connection error, '
+                                    'retrying in %i seconds.') % next_interval)
+                    time.sleep(next_interval)
+                    if CONF.sql_inc_retry_interval:
+                        next_interval = min(next_interval * 2,
+                                            CONF.sql_max_retry_interval)
+                else:
+                    LOG.exception(_('DB exception wrapped.'))
+                    raise exception.DBError(e)
+            except sqla_exc.IntegrityError, e:
+                # note(boris-42): SqlAlchemy doesn't unify errors from different
+                # DBs so we must do this. Also in some tables (for example
+                # instance_types) there are more than one unique constraint. This
+                # means we should get names of columns, which values violate
+                # unique constraint, from error message.
+                raise_if_duplicate_entry_error(e, get_engine().name)
+                raise exception.DBError(e)
+            except sqla_exc.InvalidRequestError as e:
+                exc_re = re.search('(.*)Original\s+exception\s+was:'
+                                   '\s+\((.*)\)\s+\((.*)\)', e.args[0])
+                if exc_re:
+                    invalidreqerror_msg = exc_re.group(1)
+                    original_exception_type = exc_re.group(2)
+                    original_exception_value = exc_re.group(3)
+                    if re.search('rollback', invalidreqerror_msg):
+                        get_session().rollback()
+                    if is_db_connection_error(original_exception_value):
+                        if remaining == 0:
+                            LOG.exception(_('DB exceeded retry limit.'))
+                            raise DBError(e)
+                        if remaining != 'infinite':
+                            remaining -= 1
+                        LOG.exception(_('DB connection error, '
+                                        'retrying in %i seconds.')
+                                      % next_interval)
+                        time.sleep(next_interval)
+                        if CONF.sql_inc_retry_interval:
+                            next_interval = min(next_interval * 2,
+                                                CONF.sql_max_retry_interval)
+                    else:
+                        LOG.exception(_('DB exception wrapped.'))
+                        raise exception.DBError(e)
+                else:
+                    LOG.exception(_('DB exception wrapped.'))
+                    raise exception.DBError(e)
+            except Exception, e:
+                LOG.exception(_('DB exception wrapped.'))
+                raise exception.DBError(e)
+
     return _wrap
 
 
@@ -443,6 +515,8 @@ def get_engine():
     """Return a SQLAlchemy engine."""
     global _ENGINE
     if _ENGINE is None:
+        print CONF.sql_connection
+#        raise Exception((_ENGINE, CONF.sql_connection))
         _ENGINE = create_engine(CONF.sql_connection)
     return _ENGINE
 
@@ -590,6 +664,22 @@ class Session(sqlalchemy.orm.session.Session):
     @wrap_db_error
     def execute(self, *args, **kwargs):
         return super(Session, self).execute(*args, **kwargs)
+
+    @wrap_db_error
+    def begin(self, *args, **kwargs):
+        return super(Session, self).begin(*args, **kwargs)
+
+    @wrap_db_error
+    def delete(self, *args, **kwargs):
+        return super(Session, self).delete(*args, **kwargs)
+
+    @wrap_db_error
+    def commit(self, *args, **kwargs):
+        return super(Session, self).commit(*args, **kwargs)
+
+    @wrap_db_error
+    def rollback(self, *args, **kwargs):
+        return super(Session, self).rollback(*args, **kwargs)
 
 
 def get_maker(engine, autocommit=True, expire_on_commit=False):
